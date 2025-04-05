@@ -1,145 +1,143 @@
-
-import requests
-from bs4 import BeautifulSoup
-import json
-import time
+import requests, json, time, os, ssl
 import smtplib
+from bs4 import BeautifulSoup
+from flask import Flask, request
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-import os
 
-USERNAME = "saif.hallem@uomustansiriyah.edu.iq"
-PASSWORD = "Adam@adam15"
-LOGIN_URL = "https://asdps.rdd.edu.iq/login"
-WORKSHOPS_URL = "https://asdps.rdd.edu.iq/resources/workshops"
+app = Flask(__name__)
+
+WORKSHOP_URL = "https://asdps.rdd.edu.iq/resources/workshops"
 WORKSHOP_BASE = "https://asdps.rdd.edu.iq/resources/workshops/"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+TELEGRAM_TOKEN = os.getenv("Telegram_bot_token")
+CHAT_ID = os.getenv("telegram_chat_id")
+EMAIL_FROM = os.getenv("Email_address")
+EMAIL_PASSWORD = os.getenv("email_password")
+EMAIL_TO = "showursmile88@gmail.com"
 
-session = requests.Session()
+ssl._create_default_https_context = ssl._create_unverified_context
+
+monitoring_enabled = True
+
+registration_log_file = "registration_log.json"
 
 def send_telegram(text):
-    if not CHAT_ID: return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": text}
-    requests.post(url, data=data)
-
-def send_email(subject, body):
-    msg = MIMEText(body, 'plain')
-    msg['Subject'] = subject
-    msg['From'] = EMAIL_ADDRESS
-    msg['To'] = EMAIL_ADDRESS
-    try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_ADDRESS, EMAIL_ADDRESS, msg.as_string())
-        server.quit()
-    except Exception as e:
-        print("Email sending failed:", e)
-
-def login():
-    r = session.get(LOGIN_URL, verify=False)
-    soup = BeautifulSoup(r.text, "html.parser")
-    token_input = soup.find("input", {"name": "_token"})
-    if not token_input:
-        print("❌ Could not find _token. Site structure may have changed.")
-        return False
-    token = token_input["value"]
-    payload = {
-        "_token": token,
-        "email": USERNAME,
-        "password": PASSWORD
-    }
-    res = session.post(LOGIN_URL, data=payload, verify=False)
-    return "لوحة التحكم" in res.text
-
-def fetch_workshops():
-    r = session.get(WORKSHOPS_URL, verify=False)
-    soup = BeautifulSoup(r.text, "html.parser")
-    rows = soup.find_all("tr")
-    data = {}
-    for row in rows:
-        cols = row.find_all("td")
-        if len(cols) < 10:
-            continue
-        wid = cols[0].text.strip()
-        active = "color: green" in str(cols[0])
-        reg_text = cols[5].text.strip()
-        data[wid] = {"active": active, "reg": reg_text}
-    return data
-
-def get_details(wid):
-    url = WORKSHOP_BASE + wid
-    r = session.get(url, verify=False)
-    soup = BeautifulSoup(r.text, "html.parser")
-    rows = soup.find_all("tr")
-    info = {"url": url, "id": wid}
-    for row in rows:
-        cols = row.find_all("td")
-        if len(cols) == 2:
-            k = cols[0].text.strip()
-            v = cols[1].text.strip()
-            info[k] = v
-    info["online"] = info.get("هل الورشة الالكترونية؟", "") == "✓"
-    info["place"] = info.get("مكان اقامة الورشة", "")
-    info["title"] = info.get("اسم الورشة", "No title")
-    info["lecturer"] = info.get("محاضر", "Unknown")
-    info["units"] = info.get("الوحدات", "?")
-    info["time"] = info.get("تاريخ بدء", "")
-    info["registered"] = info.get("المسجلين", "?")
-    info["status"] = info.get("التسجيل", "")
-    return info
-
-def try_register(wid):
-    try:
-        url = f"{WORKSHOP_BASE}{wid}/register"
-        r = session.post(url, verify=False)
-        return r.status_code == 200
-    except:
-        return False
-
-def notify_all(msg):
-    send_telegram(msg)
-    send_email("Workshop Update", msg)
-
-def main():
-    if not login():
-        print("❌ Login failed.")
+    if not CHAT_ID or not TELEGRAM_TOKEN:
         return
-    print("✅ Logged in. Monitoring started.")
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, data=data)
+    except Exception as e:
+        print("Telegram error:", e)
+
+def notify_all(msg, send_to_email=True):
+    send_telegram(msg)
+
+def get_current_workshops():
+    try:
+        response = requests.get(WORKSHOP_URL, verify=False)
+        soup = BeautifulSoup(response.text, "html.parser")
+        return soup.select(".views-row .title a")
+    except Exception as e:
+        print("Error fetching workshops:", e)
+        return []
+
+def save_registration_log(data):
+    with open(registration_log_file, "w") as f:
+        json.dump(data, f, indent=2)
+
+def load_registration_log():
+    if not os.path.exists(registration_log_file):
+        return {}
+    with open(registration_log_file, "r") as f:
+        return json.load(f)
+
+def workshop_monitor():
+    global monitoring_enabled
     try:
         with open("state.json", "r") as f:
             old = json.load(f)
     except:
         old = {}
 
+    registration_log = load_registration_log()
+
     while True:
-        new = fetch_workshops()
-        for wid in new:
-            if wid not in old or new[wid] != old[wid]:
-                details = get_details(wid)
-                msg = f"📢 Workshop Update:\n"
-                msg += f"🧾 Title: {details['title']}\n"
-                msg += f"👤 Lecturer: {details['lecturer']}\n"
-                msg += f"📅 Date: {details['time']}\n"
-                msg += f"🧮 Units: {details['units']}\n"
-                msg += f"📍 Type: {'Online' if details['online'] else 'In-person'}\n"
-                msg += f"🔗 Link: {details['url']}\n"
-                if details['online']:
-                    msg += f"💻 Meet Link: {details['place']}\n"
-                if new[wid]["active"] and details["status"] == "ليس مسجلاً بعد" and details["online"]:
-                    if try_register(wid):
-                        msg += "✅ Auto-registered successfully.\n"
-                    else:
-                        msg += "⚠️ Could not auto-register.\n"
-                notify_all(msg)
-        with open("state.json", "w") as f:
-            json.dump(new, f)
-        time.sleep(600)
+        if not monitoring_enabled:
+            time.sleep(5)
+            continue
+
+        new = {}
+        links = get_current_workshops()
+        msg = ""
+
+        for link in links:
+            href = link["href"]
+            wid = href.split("/")[-1]
+            new[wid] = {
+                "text": link.text.strip(),
+                "url": WORKSHOP_BASE + wid
+            }
+            if wid not in old:
+                msg += f"\n🔔 *ورشة جديدة:*\n{link.text.strip()}\n{WORKSHOP_BASE + wid}\n\n"
+                registration_log[wid] = {
+                    "title": link.text.strip(),
+                    "url": WORKSHOP_BASE + wid,
+                    "timestamp": datetime.now().isoformat()
+                }
+
+        if msg:
+            notify_all(msg, send_to_email=False)
+            with open("state.json", "w") as f:
+                json.dump(new, f)
+            save_registration_log(registration_log)
+
+        time.sleep(900)  # كل 15 دقيقة
+
+@app.route("/telegram", methods=["POST"])
+def telegram_webhook():
+    global monitoring_enabled
+    data = request.json
+    msg = data.get("message", {})
+    text = msg.get("text", "")
+    chat_id = str(msg.get("chat", {}).get("id"))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if chat_id != CHAT_ID:
+        send_telegram("🚫 هذا البوت مخصص لحساب مصرح به فقط.")
+        return "", 200
+
+    text = text.lower().strip()
+
+    if text == "/status":
+        status_msg = "🤖 البوت يعمل الآن ويُراقب الورش." if monitoring_enabled else "⛔️ البوت متوقف مؤقتًا عن المراقبة."
+        send_telegram(f"{status_msg}\n🕓 التاريخ والوقت: {now}")
+    elif text == "/stop":
+        monitoring_enabled = False
+        send_telegram("⛔️ تم إيقاف مراقبة الورش مؤقتاً ورح ننتظرك ترجعلنا مهندسنا الرائع")
+    elif text == "/start":
+        monitoring_enabled = True
+        send_telegram("✅ تم استئناف مراقبة الورش وتدلل علينا مهندسنا الغالي")
+    elif text == "/log":
+        reg_log = load_registration_log()
+        if not reg_log:
+            send_telegram("📭 لا يوجد سجل ورشات مسجلة حالياً.")
+        else:
+            send_telegram("🧪 *سجل الورش المسجلة:*")
+            for wid, item in reg_log.items():
+                send_telegram(f"📝 *{item['title']}*\n🔗 {item['url']}\n🕓 {item['timestamp']}")
+
+    return "", 200
+
+@app.route("/")
+def home():
+    return "✅ Bot is alive and monitoring workshops..."
 
 if __name__ == "__main__":
-    main()
+    send_telegram("🤖 تم تشغيل سكربت مراقبة الورش الآن بنجاح على Replit")
+    import threading
+    threading.Thread(target=workshop_monitor).start()
+    app.run(host="0.0.0.0", port=8080)
